@@ -1,6 +1,6 @@
 {
-  "installCommand": "npm install",
-  "buildCommand": "npm run build",
+  "installCommand": "true",
+  "buildCommand": "node build.mjs",
   "outputDirectory": "./dist",
   "nodeVersion": "22.11.0"
 }
