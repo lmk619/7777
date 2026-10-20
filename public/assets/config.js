@@ -9,7 +9,7 @@
  * 千万不要把 SecretId / SecretKey / 数据库密码 / DeepSeek Key 写进这个文件。
  */
 window.PRENTICE_CONFIG = {
-  envId: '',
+  envId: 'chushiba-d0gjks4hh2f41cc8e',
   region: 'ap-shanghai',
   accessKey: ''
 };
