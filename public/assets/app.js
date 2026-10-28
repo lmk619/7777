@@ -1,7 +1,9 @@
 /* 出师吧 · 前端主程序（无框架，单文件）
  * - SQL 在浏览器里用 sql.js（SQLite WebAssembly）运行，不经过服务器
  * - AI 导师走 /api/chat（服务器上的函数转发给 DeepSeek，Key 不在前端）
- * - 账号、进度、讨论保存在本机浏览器 localStorage（演示版，正式版需要后端）
+ * - 账号、进度、讨论默认保存在本机浏览器 localStorage（本机演示模式）
+ * - 在 assets/config.js 填了 CloudBase 环境 ID 后：注册 / 登录走 CloudBase 账号，
+ *   进度和答题记录通过云函数同步到云端（见 assets/cloud.js、cloudfunctions/），本机 localStorage 只当缓存
  */
 (function () {
   'use strict';
@@ -37,7 +39,100 @@
   }
   function migrate() { if (!S) return; S.customs = S.customs || []; S.likes = S.likes || {}; S.posts = S.posts || []; }
   migrate();
-  function save() { if (!S) return; ACC[S.user.email] = S; lsSet(ACC_KEY, JSON.stringify(ACC)); lsSet(CUR_KEY, S.user.email); }
+  function save() { if (!S) return; ACC[S.user.email] = S; lsSet(ACC_KEY, JSON.stringify(ACC)); lsSet(CUR_KEY, S.user.email); scheduleCloudSave(); }
+
+  /* ================= 云端同步（CloudBase） ================= */
+  var Cloud = window.Cloud || { enabled: false };
+  var CLOUD = !!Cloud.enabled;
+  var cloudReady = false, cloudTimer = null;
+  var lastRetry = 0;
+  function scheduleCloudSave() {
+    if (CLOUD && !cloudReady && S && Date.now() - lastRetry > 30000) {   // 启动时没连上云端：之后每次存档最多 30 秒重试一次
+      lastRetry = Date.now();
+      Cloud.session().then(function (sess) { if (sess && !cloudReady) return cloudLogin(sess, { email: sess.email }).then(function () { toast('已连上云端，进度已同步'); }); }).catch(function () {});
+      return;
+    }
+    if (!CLOUD || !cloudReady || !S) return;
+    clearTimeout(cloudTimer);
+    cloudTimer = setTimeout(pushState, 3000);          // 3 秒内多次改动只上传一次
+  }
+  function pushState() {
+    cloudTimer = null;
+    if (!CLOUD || !cloudReady || !S) return Promise.resolve();
+    return Cloud.user('saveState', { state: JSON.stringify(S), totalQuestions: D.QUESTIONS.length })
+      .catch(function (e) { console.warn('[出师吧] 进度上传失败，稍后会重试', e); });
+  }
+  function track(key, correct, attemptNo, extra) {
+    if (!CLOUD || !S) return;
+    Cloud.track(Object.assign({ key: key, kind: /^p/.test(key) ? 'project' : 'question', correct: !!correct, attemptNo: attemptNo || 1 }, extra || {}));
+  }
+  function evt(type, props) { if (CLOUD && S) Cloud.event(type, props); }
+  function feature(name, ref) { evt('feature', ref ? { name: name, ref: String(ref) } : { name: name }); }
+  window.addEventListener('pagehide', function () { if (cloudTimer) { clearTimeout(cloudTimer); pushState(); } });
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden' && cloudTimer) { clearTimeout(cloudTimer); pushState(); } });
+
+  /* 本机旧进度 + 云端进度合并：做对的题取并集，经验值和解锁关卡取较大值，项目取完成度更高的那份 */
+  function mergeState(a, b) {
+    if (!a) return b; if (!b) return a;
+    var m = JSON.parse(JSON.stringify(b)), A = JSON.parse(JSON.stringify(a));
+    function obj(x) { return x && typeof x === 'object' ? x : {}; }
+    m.schoolDone = !!(A.schoolDone || m.schoolDone); m.tested = !!(A.tested || m.tested);
+    m.unlockedTo = Math.max(A.unlockedTo || 0, m.unlockedTo || 0); m.startLevel = Math.max(A.startLevel || 0, m.startLevel || 0);
+    m.xp = obj(m.xp); Object.keys(obj(A.xp)).forEach(function (k) { m.xp[k] = Math.max(m.xp[k] || 0, A.xp[k] || 0); });
+    m.solved = obj(m.solved); Object.keys(obj(A.solved)).forEach(function (k) { if (!m.solved[k] || String(A.solved[k].at || '') < String(m.solved[k].at || '')) m.solved[k] = A.solved[k]; });
+    m.attempts = obj(m.attempts); Object.keys(obj(A.attempts)).forEach(function (k) { m.attempts[k] = Math.max(m.attempts[k] || 0, A.attempts[k] || 0); });
+    m.drafts = Object.assign({}, obj(A.drafts), obj(m.drafts));
+    m.variants = Object.assign({}, obj(A.variants), obj(m.variants));
+    m.likes = Object.assign({}, obj(A.likes), obj(m.likes));
+    m.badges = obj(m.badges); Object.keys(obj(A.badges)).forEach(function (k) { if (!m.badges[k] || A.badges[k] < m.badges[k]) m.badges[k] = A.badges[k]; });
+    var mk = {}; (A.mistakes || []).concat(m.mistakes || []).forEach(function (x) { if (x && x.key && (!mk[x.key] || String(x.at) > String(mk[x.key].at))) mk[x.key] = x; });
+    m.mistakes = Object.keys(mk).map(function (k) { return mk[k]; }).filter(function (x) { return !m.solved[x.key]; }).sort(function (x, y) { return String(y.at).localeCompare(String(x.at)); }).slice(0, 200);
+    m.projects = obj(m.projects); Object.keys(obj(A.projects)).forEach(function (k) {
+      var x = A.projects[k], y = m.projects[k];
+      function rank(p) { return p ? (p.score != null ? 1000 + p.score : 0) + (p.done || []).filter(Boolean).length : -1; }
+      if (rank(x) > rank(y)) m.projects[k] = x;
+    });
+    function unionBy(xs, ys, key) { var seen = {}, out = []; (xs || []).concat(ys || []).forEach(function (x) { var k = key(x); if (!seen[k]) { seen[k] = 1; out.push(x); } }); return out; }
+    m.customs = unionBy(m.customs, A.customs, function (x) { return String(x && x.seed); });
+    m.posts = unionBy(m.posts, A.posts, function (x) { return String(x && x.id); });
+    m.rewards = unionBy(m.rewards, A.rewards, function (x) { return String(x && x.month) + '|' + String(x && x.name); });
+    if (A.daily && (!m.daily || A.daily.date > m.daily.date || (A.daily.date === m.daily.date && A.daily.done > m.daily.done))) { m.daily = A.daily; m.pet = A.pet || m.pet; }
+    if (A.streak && A.streak.last && (!m.streak || !m.streak.last || A.streak.last > m.streak.last)) m.streak = A.streak;
+    if (A.vip && A.vip.until && (!m.vip || !m.vip.until || A.vip.until > m.vip.until)) m.vip = A.vip;
+    if (A.rebate && m.rebate && A.rebate.month === m.rebate.month) m.rebate.days = Math.max(A.rebate.days || 0, m.rebate.days || 0);
+    m.user = obj(m.user); Object.keys(obj(A.user)).forEach(function (k) { if (!m.user[k] && A.user[k]) m.user[k] = A.user[k]; });
+    if (!m.invitedBy && A.invitedBy) m.invitedBy = A.invitedBy;
+    return m;
+  }
+  window.PrenticeMergeState = mergeState;            // 方便测试
+
+  /* 登录 CloudBase 成功后：建档 / 更新登录时间，拉云端进度并和本机旧进度合并 */
+  function cloudLogin(sess, hint) {
+    hint = hint || {};
+    var email = (hint.email || sess.email || '').toLowerCase();
+    var profile = ACC[email] ? ACC[email].user : { nickname: hint.nickname || '' };
+    return Cloud.user('login', { email: email, profile: profile, invitedBy: hint.invite || '', totalQuestions: D.QUESTIONS.length }).then(function (r) {
+      if (r.profile && r.profile.email) email = r.profile.email;          // 以服务器记录的邮箱为准
+      var cloud = r.state || null;
+      var invitedNow = false;
+      var local = (S && S.user && S.user.email === email) ? S : (ACC[email] || null);   // 同步期间用户刚做的题也算进去
+      var merged = mergeState(local, cloud);
+      if (!merged) {
+        merged = fresh({ email: email, nickname: hint.nickname || (r.profile && r.profile.nickname) || email.split('@')[0], school: '', major: '', grade: '', rivals: '' });
+        if (hint.invite && hint.invite !== hash(email).slice(0, 6)) { merged.invitedBy = hint.invite; merged.vip = { until: addDaysStr(today(), 2), source: '邀请体验' }; invitedNow = true; }
+      }
+      merged.user = merged.user || {};
+      merged.user.email = email;
+      if (!merged.user.nickname) merged.user.nickname = (r.profile && r.profile.nickname) || email.split('@')[0];
+      S = merged; migrate();
+      cloudReady = true;
+      Cloud.setUser(r.uid || sess.uid);
+      if (invitedNow) Cloud.event('vip_activated', { source: '邀请体验', until: S.vip.until });
+      save(); pushState();                              // 合并后的结果立刻写回云端
+      Cloud.flush();
+      return S;
+    });
+  }
   function isVip() { return !!(S && S.vip.until && S.vip.until >= today()); }
   function myCode() { return hash(S.user.email).slice(0, 6); }
 
@@ -141,7 +236,9 @@
   /* ================= AI 导师 ================= */
   var aiState = { down: false, why: '' };
   function normSql(s) { return String(s || '').toLowerCase().replace(/[\s;`]+/g, ''); }
+  var AI_FEATURE = { hint: 'ai_hint', ask: 'ai_ask', followup: 'ai_followup', grade_followup: 'ai_grade_followup', grade_conclusion: 'ai_conclusion', variant: 'ai_variant', resume: 'ai_resume' };
   function ai(body) {
+    if (body && AI_FEATURE[body.mode]) feature(AI_FEATURE[body.mode]);
     return fetch('api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json().catch(function () { return { error: 'bad' }; }).then(function (j) { j._status = r.status; return j; }); })
       .then(function (j) {
@@ -334,20 +431,28 @@
   /* ================= 页面 ================= */
   var V = {};
 
+  function loginHero(invite) {
+    return '<section class="auth-hero wrap"><div class="wordmark"><b>出师吧</b><i>PRENTICE</i></div><h1 style="margin-top:8px">今天，你是一名<br><span class="grad">数据分析实习生</span>。</h1>' +
+      '<p class="sub">不是刷题，是上班。业务方丢来一个问题，你用 SQL 找到原因，再写成一段能放进简历的项目经历。</p>' +
+      (invite ? '<div class="offer">同学邀请你加入：注册即送 VIP 3 天</div>' : '') + '</section>';
+  }
+  function loginFeatures() {
+    return '<div class="features"><div class="card"><div class="feat-ico" style="background:#0a84ff">SQL</div><b>打开即练</b><span class="muted small">不用装任何软件，数据库就在你的浏览器里。第 0–8 关、' + D.QUESTIONS.length + ' 道题全部免费。</span></div>' +
+      '<div class="card"><div class="feat-ico" style="background:#30d158">AI</div><b>只给提示的导师</b><span class="muted small">先指方向，再点语法，最后才给半句代码。答对之后还会追问业务问题。</span></div>' +
+      '<div class="card"><div class="feat-ico" style="background:#ff9f0a">100</div><b>100 个实习项目</b><span class="muted small">外卖、出海、SaaS、游戏……按"描述 → 拆解 → 归因 → 结论"完成一次真实感的分析。</span></div></div>';
+  }
+
   V.login = function (p) {
+    if (CLOUD) return cloudLoginView(p);
     var invite = p.invite;
     return {
-      html: '<div class="page"><section class="auth-hero wrap"><div class="wordmark"><b>出师吧</b><i>PRENTICE</i></div><h1 style="margin-top:8px">今天，你是一名<br><span class="grad">数据分析实习生</span>。</h1>' +
-        '<p class="sub">不是刷题，是上班。业务方丢来一个问题，你用 SQL 找到原因，再写成一段能放进简历的项目经历。</p>' +
-        (invite ? '<div class="offer">同学邀请你加入：注册即送 VIP 3 天</div>' : '') + '</section>' +
+      html: '<div class="page">' + loginHero(invite) +
         '<section class="wrap" style="padding-bottom:30px"><form class="card auth-form" id="f" novalidate><h3 style="margin-bottom:18px;text-align:center">注册或登录</h3>' +
         '<div class="field"><label for="em">邮箱</label><input class="input" id="em" type="email" placeholder="you@example.com" autocomplete="email" required></div>' +
         '<div class="field"><label for="nk">昵称</label><input class="input" id="nk" placeholder="排名和讨论区里显示这个" maxlength="16"></div>' +
         '<button class="btn primary lg" style="width:100%" type="submit">继续</button>' +
         '<p class="faint xs" style="margin:14px 0 0;text-align:center">演示版：账号保存在这台设备的浏览器里，不需要密码。</p></form>' +
-        '<div class="features"><div class="card"><div class="feat-ico" style="background:#0a84ff">SQL</div><b>打开即练</b><span class="muted small">不用装任何软件，数据库就在你的浏览器里。第 0–8 关、' + D.QUESTIONS.length + ' 道题全部免费。</span></div>' +
-        '<div class="card"><div class="feat-ico" style="background:#30d158">AI</div><b>只给提示的导师</b><span class="muted small">先指方向，再点语法，最后才给半句代码。答对之后还会追问业务问题。</span></div>' +
-        '<div class="card"><div class="feat-ico" style="background:#ff9f0a">100</div><b>100 个实习项目</b><span class="muted small">外卖、出海、SaaS、游戏……按"描述 → 拆解 → 归因 → 结论"完成一次真实感的分析。</span></div></div></section>' +
+        loginFeatures() + '</section>' +
         '<div class="footer">所有公司与数据均为虚构，仅用于练习。</div></div>',
       bind: function (el) {
         $('#f', el).addEventListener('submit', function (e) {
@@ -362,6 +467,64 @@
       }
     };
   };
+
+  /* 云端模式的登录页：只有"邮箱 + 密码"。已注册直接登录；没注册的邮箱确认一下就自动建号，不需要验证码 */
+  function cloudLoginView(p) {
+    var invite = p.invite;
+    var pwHint = '8–32 位，同时包含字母和数字';
+    return {
+      html: '<div class="page">' + loginHero(invite) +
+        '<section class="wrap" style="padding-bottom:30px"><form class="card auth-form" id="f" novalidate><h3 style="margin-bottom:18px;text-align:center">登录或注册</h3>' +
+        '<div class="field"><label for="em">邮箱</label><input class="input" id="em" type="email" placeholder="you@example.com" autocomplete="email"></div>' +
+        '<div class="field"><label for="pw">密码</label><input class="input" id="pw" type="password" placeholder="新用户直接设置一个密码" autocomplete="current-password"></div>' +
+        '<div id="newbox" style="display:none"><div class="banner" style="margin:4px 0 14px">这个邮箱还没注册。确认无误的话，用刚才的密码直接创建账号。</div>' +
+        '<div class="field"><label for="nk">昵称（选填）</label><input class="input" id="nk" placeholder="排名和讨论区里显示这个" maxlength="16"></div></div>' +
+        '<button class="btn primary lg" style="width:100%" type="submit" id="go">继续</button>' +
+        '<button class="btn sm" style="width:100%;margin-top:10px" type="button" id="back" style="display:none">邮箱填错了，重新输入</button>' +
+        '<p class="faint xs" style="margin:14px 0 0;text-align:center">新用户不需要验证码，输入邮箱和密码就能开始。学习进度会同步到云端，换设备也能接着练。<br>忘记密码请联系管理员重置。</p></form>' +
+        loginFeatures() + '</section>' +
+        '<div class="footer">所有公司与数据均为虚构，仅用于练习。</div></div>',
+      bind: function (el) {
+        var busy = false, creating = false, goBtn = $('#go', el), em = $('#em', el), pw = $('#pw', el);
+        var last = Cloud.lastEmail && Cloud.lastEmail(); if (last && !em.value) em.value = last;
+        function lock(on, text) { busy = on; goBtn.disabled = on; goBtn.textContent = text; }
+        function setCreating(on) {
+          creating = on; $('#newbox', el).style.display = on ? '' : 'none'; $('#back', el).style.display = on ? '' : 'none';
+          em.readOnly = on; lock(false, on ? '创建账号并开始' : '继续');
+        }
+        $('#back', el).onclick = function () { setCreating(false); em.focus(); };
+        function finish(r, email, nick) {
+          return Cloud.session().then(function (sess) {
+            if (!sess) throw { message: '登录状态没有建立，请重试' };
+            return cloudLogin({ uid: sess.uid, email: email }, { email: email, nickname: nick, invite: invite });
+          }).then(function () {
+            toast(r.created ? '注册成功，欢迎加入' : '欢迎回来，' + S.user.nickname);
+            go(S.schoolDone ? '#/home' : '#/school');
+          });
+        }
+        $('#f', el).addEventListener('submit', function (e) {
+          e.preventDefault(); if (busy) return;
+          var email = em.value.trim().toLowerCase(), password = pw.value;
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { toast('邮箱格式不太对'); return; }
+          if (!password) { toast('请输入密码'); return; }
+          if (creating) {
+            if (!(password.length >= 8 && password.length <= 32 && /[A-Za-z]/.test(password) && /\d/.test(password))) { toast('密码需要 ' + pwHint); return; }
+            var nick = $('#nk', el).value.trim().slice(0, 16);
+            lock(true, '创建中…');
+            Cloud.passwordLogin(email, password, { create: true, nickname: nick })
+              .then(function (r) { return finish(r, email, nick); })
+              .catch(function (er) { toast(Cloud.errText(er)); lock(false, '创建账号并开始'); });
+            return;
+          }
+          lock(true, '登录中…');
+          Cloud.passwordLogin(email, password).then(function (r) {
+            if (r.status === 'no_account') { setCreating(true); toast('这个邮箱还没注册，确认后即可创建'); return; }
+            return finish(r, email, '');
+          }).catch(function (er) { toast(Cloud.errText(er)); lock(false, '继续'); });
+        });
+      }
+    };
+  }
 
   V.school = function () {
     var u = S.user;
@@ -539,12 +702,14 @@
         S.mistakes = S.mistakes.filter(function (m) { return m.key !== key; });
         S.mistakes.unshift({ key: key, title: opt.title, sql: ta.value, why: why, at: today(), db: opt.dbname, ref: opt.ref, route: location.hash });
         if (S.mistakes.length > 200) S.mistakes.length = 200;
-        save(); hint(Math.min(3, attempts));
+        save(); track(key, false, attempts); hint(Math.min(3, attempts));
       }
       function win(r) {
         show(r, '<div class="verdict ok">答对了。' + (solvedNow ? '（之前已经通过）' : '') + '</div>');
         var qc = $('#qcard', el);
         if (!$('.passed', el)) { qc.classList.add('has-pass'); qc.insertAdjacentHTML('afterbegin', '<span class="passed">已通过</span>'); }
+        if (!solvedNow && S.solved[key]) solvedNow = true;     // 云端同步后才知道已经做过，不重复加经验
+        track(key, true, (S.attempts[key] || 0) + 1, { firstSolve: !solvedNow });
         if (!solvedNow) {
           solvedNow = true;
           var gain = Math.max(4, 10 - 3 * Math.min(2, attempts));
@@ -656,7 +821,7 @@
         $('#cf', el).addEventListener('submit', function (e) {
           e.preventDefault();
           var opt = { seed: 10000 + Math.floor(Math.random() * 89990000), industry: $('#ind', el).value, role: $('#role', el).value, stars: +$('#lv', el).value, at: today() };
-          S.customs.unshift(opt); save();
+          S.customs.unshift(opt); save(); feature('custom_data', opt.industry || '随机');
           toast('数据生成好了');
           go('#/p/C' + String(opt.seed).slice(-5));
         });
@@ -676,6 +841,7 @@
     var firstOpen = 0; while (firstOpen < P.steps.length && st.done[firstOpen]) firstOpen++;
     var note = P.gen && P.gen.metric.note ? P.gen.metric.note : (P.db === 'waimai' ? '某外卖平台 · 2026 年 8–9 月 · 模拟数据' : P.db === 'shenglang' ? '声浪科技 · 和练习题同一个库' : '');
     if (stepNo == null) {
+      feature('project_open', P.id);
       var all = firstOpen >= P.steps.length, done = projDone(P.id);
       return {
         html: '<div class="page"><section class="section white" style="padding:44px 0 40px"><div class="wrap"><a href="#/projects" class="back">‹ 全部项目</a><div class="kicker gray">TASK ' + P.id + ' · ' + esc(P.company) + ' · ' + esc(P.role) + '</div>' +
@@ -724,7 +890,7 @@
               var sc = Math.max(0, Math.min(100, parseInt(j.score, 10) || 0)), first = st.score == null;
               st.score = sc; st.good = j.good; st.improve = j.improve; st.done[stepNo] = true;
               if (first) { S.xp.business += sc; progress(); S.badges.proj = today(); }
-              save(); go('#/p/' + P.id);
+              save(); track('p' + P.id + '-c', sc >= 60, 1, { kind: 'project', score: sc }); if (first) feature('project_done', P.id); go('#/p/' + P.id);
               toast('出师一步！项目完成 · 业务思维 +' + (first ? sc : 0) + (j.offline ? '（离线评分）' : ''));
             });
         };
@@ -751,6 +917,7 @@
     };
   }
   function posterModal(P, st) {
+    feature('poster', P ? P.id : 'card');
     modal('<div class="poster"><div class="xs" style="color:#a1a1a6;position:relative;z-index:1">出师吧 · ' + (P ? '项目海报' : '能力卡片') + '</div><h2 style="margin:10px 0 6px">' + esc(P ? P.title : '我的 SQL 能力卡片') + '</h2>' +
       '<p class="muted small" style="margin:0 0 22px">' + esc(S.user.nickname) + (S.user.school ? ' · ' + esc(S.user.school) : '') + (P ? ' · ' + esc(P.role) + '（模拟）' : '') + '</p>' +
       '<div class="row" style="gap:34px;position:relative;z-index:1"><div class="stat"><b>' + (P ? st.score : solvedCount()) + '</b><span style="color:#a1a1a6">' + (P ? '导师评分' : '答对题数') + '</span></div><div class="stat"><b>' + streakNow() + '</b><span style="color:#a1a1a6">连续打卡</span></div><div class="stat"><b>' + (S.xp.business || 0) + '</b><span style="color:#a1a1a6">业务思维 xp</span></div></div>' +
@@ -776,9 +943,16 @@
         '<label class="row small"><input type="checkbox" id="s-rk" ' + (S.settings.ranking ? 'checked' : '') + '> 参与校园排名（只显示昵称）</label><label class="row small" style="margin-top:8px"><input type="checkbox" id="s-nt" ' + (S.settings.notify ? 'checked' : '') + '> 宠物饿了时提醒我（每天最多一次）</label>' +
         '<div class="row" style="margin-top:18px"><button class="btn primary sm">保存</button><span class="spacer"></span><button class="btn sm" type="button" id="out">退出登录</button></div><p class="faint xs" style="margin:12px 0 0">登录邮箱：' + esc(S.user.email) + '</p></form></div></div></div>',
       bind: function (el) {
+        if (vip && mk.length) feature('mistake_book');
         $('#card', el).onclick = function () { posterModal(null); };
         $('#set', el).addEventListener('submit', function (e) { e.preventDefault(); S.user.nickname = $('#s-nk', el).value.trim() || S.user.nickname; S.user.school = $('#s-sc', el).value.trim(); S.settings.ranking = $('#s-rk', el).checked; S.settings.notify = $('#s-nt', el).checked; save(); chrome('me'); toast('已保存'); });
-        $('#out', el).onclick = function () { lsSet(CUR_KEY, ''); S = null; go('#/login'); };
+        $('#out', el).onclick = function () {
+          if (!CLOUD) { lsSet(CUR_KEY, ''); S = null; go('#/login'); return; }
+          this.disabled = true; clearTimeout(cloudTimer);
+          pushState().then(function () { return Cloud.logout(); }).then(function () {   // 先把最后的进度传完再退出
+            lsSet(CUR_KEY, ''); S = null; cloudReady = false; go('#/login');
+          });
+        };
         $$('[data-var]', el).forEach(function (b) {
           b.onclick = function () {
             var m = S.mistakes[+b.dataset.var]; b.disabled = true; b.textContent = '出题中…';
@@ -811,7 +985,7 @@
       bind: function (el) {
         $$('.filters [data-f]', el).forEach(function (b) { b.onclick = function () { go('#/community?f=' + encodeURIComponent(b.dataset.f)); }; });
         $$('[data-like]', el).forEach(function (b) { b.onclick = function () { var k = b.dataset.like; if (S.likes[k]) delete S.likes[k]; else S.likes[k] = 1; save(); render(); }; });
-        $('#cp', el).onclick = function () { var i = $('#lnk', el); i.select(); try { navigator.clipboard.writeText(i.value).then(function () { toast('邀请链接已复制'); }, function () { document.execCommand('copy'); toast('邀请链接已复制'); }); } catch (e) { document.execCommand('copy'); toast('邀请链接已复制'); } };
+        $('#cp', el).onclick = function () { evt('invite_copy'); var i = $('#lnk', el); i.select(); try { navigator.clipboard.writeText(i.value).then(function () { toast('邀请链接已复制'); }, function () { document.execCommand('copy'); toast('邀请链接已复制'); }); } catch (e) { document.execCommand('copy'); toast('邀请链接已复制'); } };
         var rk = $('#rk', el); if (rk) rk.onclick = function () { S.settings.ranking = true; save(); render(); };
         $('#sh', el).onclick = function () { posterModal(null); };
       }
@@ -829,7 +1003,16 @@
         '<div class="wrap narrow" style="padding-bottom:60px"><table class="cmp"><thead><tr><th>权益</th><th>免费</th><th class="v">VIP</th></tr></thead><tbody>' + rows.map(function (r) { return '<tr><td>' + r[0] + '</td><td class="' + (r[1] === '—' ? 'n' : 'y') + '">' + r[1] + '</td><td class="y">' + r[2] + '</td></tr>'; }).join('') + '</tbody></table>' +
         '<div class="card" style="margin-top:20px"><h3>返利规则</h3><ol class="muted" style="margin:12px 0 0;padding-left:20px;line-height:1.9"><li>每天完成 ' + DAILY_TARGET + ' 道题或项目步骤，算完成当天任务。</li><li>VIP 有效期内，一个自然月累计完成 ' + REBATE_DAYS + ' 天，发放一张 9.9 元咖啡券。</li><li>重复提交已通过的题不计入；每月最多返一次。</li></ol>' +
         (vip ? '<p style="margin:14px 0 0">本月进度：<b>' + S.rebate.days + ' / ' + REBATE_DAYS + '</b> 天</p>' : '') + '</div></div></div>',
-      bind: function (el) { var b = $('#buy', el); if (b) b.onclick = function () { S.vip = { until: addDaysStr(today(), 29), source: '付费（演示）' }; save(); chrome('vip'); render(); toast('VIP 已开通'); }; }
+      bind: function (el) {
+        evt('vip_page_view');
+        var b = $('#buy', el);
+        if (b) b.onclick = function () {
+          evt('vip_click', { plan: 'month_9.9' });
+          S.vip = { until: addDaysStr(today(), 29), source: '付费（演示）' };
+          evt('vip_activated', { source: '付费（演示）', until: S.vip.until });
+          save(); chrome('vip'); render(); toast('VIP 已开通');
+        };
+      }
     };
   };
 
@@ -861,6 +1044,21 @@
   }
   window.addEventListener('hashchange', render);
 
-  initSqlJs({ locateFile: function (f) { return 'assets/' + f; } }).then(function (SQL) { window.SQLLIB = SQL; render(); })
+  /* 云端模式：先看 CloudBase 有没有登录态。有就用本机缓存秒开，后台再和云端同步；没有就去登录页 */
+  function boot() {
+    if (!CLOUD) { render(); return; }
+    Cloud.session().then(function (sess) {
+      if (!sess) { S = null; lsSet(CUR_KEY, ''); render(); return; }
+      var cached = sess.email && ACC[sess.email];
+      if (cached) { S = cached; migrate(); render(); }
+      return cloudLogin(sess, { email: sess.email }).then(function () { if (!cached) render(); else chrome(currentRoute); }, function (e) {
+        console.warn('[出师吧] 云端同步失败', e);
+        if (!cached) { S = null; render(); toast('云端连接失败：' + Cloud.errText(e)); }
+        else toast('暂时连不上云端，进度先存在本机');
+      });
+    });
+  }
+
+  initSqlJs({ locateFile: function (f) { return 'assets/' + f; } }).then(function (SQL) { window.SQLLIB = SQL; boot(); })
     .catch(function (e) { $('#app').innerHTML = '<div class="wrap" style="padding:60px 22px"><div class="card"><h2>数据库加载失败</h2><p class="muted">' + esc(e.message) + '</p><p>请换用最新版 Chrome / Edge / Safari，或刷新重试。</p></div></div>'; });
 })();
