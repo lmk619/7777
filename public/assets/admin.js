@@ -74,6 +74,11 @@
       '<div class="field"><label>每页</label><select class="input" id="ps"><option>20</option><option>50</option><option>100</option></select></div>' +
       '<button class="btn sm" id="search">筛选</button><span class="spacer"></span><button class="btn sm" id="exCsv">导出 CSV</button><button class="btn sm primary" id="exXlsx">导出 Excel</button></div>' +
       '<div class="scroll" id="utbl"></div><div class="row" style="margin-top:12px"><button class="btn sm" id="prev">‹ 上一页</button><span class="small muted" id="pinfo"></span><button class="btn sm" id="next">下一页 ›</button></div></div>' +
+      '<div class="card" style="margin-top:18px"><div class="row"><h3>VIP 与付费意向</h3><span class="spacer"></span><span class="faint small" id="vipActive"></span></div><div id="funnel" style="margin-top:12px"></div><div class="faint small" id="vipSrc" style="margin-top:10px"></div></div>' +
+      '<div class="grid g2" style="margin-top:18px;gap:18px"><div class="card"><h3>功能使用</h3><p class="faint xs" style="margin:4px 0 10px">区间内各功能被使用的次数，用来判断哪些值得放进 VIP</p><div class="scroll" style="max-height:320px" id="feat"></div></div>' +
+      '<div class="card"><div class="row"><h3>邀请拉新</h3><span class="spacer"></span><span class="faint small" id="invCount"></span></div><p class="faint xs" style="margin:4px 0 10px">按邀请人统计区间内带来的注册数</p><div class="scroll" style="max-height:320px" id="inv"></div></div></div>' +
+      '<div class="card" style="margin-top:18px"><h3>重置用户密码</h3><p class="faint xs" style="margin:4px 0 10px">用户忘记密码时，在这里帮他设一个新密码，再告诉他本人。只适用于"邮箱+密码"注册的账号。</p>' +
+      '<form class="bar" id="rp" autocomplete="off"><div class="field"><label>用户邮箱</label><input class="input" id="rpEm" type="email"></div><div class="field"><label>新密码</label><input class="input" id="rpPw" type="text" placeholder="8–32 位，含字母和数字"></div><button class="btn sm primary">重置</button></form></div>' +
       '<div class="card" style="margin-top:18px"><div class="row"><h3>订单与收入</h3><span class="chip">未接入支付</span></div><p class="muted small" id="orders" style="margin:10px 0 0">加载中…</p></div>';
 
     $('#df').value = state.dateField; $('#ps').value = String(state.pageSize);
@@ -90,6 +95,13 @@
     $('#exCsv').onclick = function () { exportUsers('csv'); };
     $('#exXlsx').onclick = function () { exportUsers('xlsx'); };
     $('#exDaily').onclick = function () { if (lastDaily) download(csv(DAILY_COLS, lastDaily), '出师吧-每日数据-' + state.from + '_' + state.to + '.csv', 'text/csv;charset=utf-8'); };
+    $('#rp').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var em = $('#rpEm').value.trim().toLowerCase(), pw = $('#rpPw').value;
+      if (!em || !pw) { toast('请填写邮箱和新密码'); return; }
+      if (!window.confirm('确认把 ' + em + ' 的密码重置为你输入的新密码？')) return;
+      Cloud.admin('resetPassword', { email: em, newPassword: pw }).then(function () { toast('已重置，请把新密码告诉用户本人'); $('#rpPw').value = ''; }, function (er) { toast(Cloud.errText(er)); });
+    });
     Cloud.admin('orders').then(function (r) { $('#orders').textContent = r.message; }, function () { $('#orders').textContent = '—'; });
     refresh();
   }
@@ -97,7 +109,24 @@
     var f = $('#from').value, t = $('#to').value;
     if (/^\d{4}-\d{2}-\d{2}$/.test(f)) state.from = f; if (/^\d{4}-\d{2}-\d{2}$/.test(t)) state.to = t;
   }
-  function refresh() { loadOverview(); loadUsers(); }
+  function refresh() { loadOverview(); loadUsers(); loadGrowth(); }
+  function loadGrowth() {
+    $('#funnel').innerHTML = '<p class="muted small">加载中…</p>';
+    Cloud.admin('growth', { from: state.from, to: state.to }).then(function (r) {
+      $('#vipActive').textContent = '当前有效 VIP：' + fmtNum(r.vipActive) + ' 人';
+      var max = Math.max(1, r.funnel[0].users);
+      $('#funnel').innerHTML = r.funnel.map(function (f) {
+        var w = Math.max(2, Math.round(f.users / max * 100));
+        return '<div style="display:grid;grid-template-columns:120px 1fr 120px;align-items:center;gap:10px;margin:6px 0"><span class="small">' + esc(f.step) + '</span>' +
+          '<div style="background:var(--bg2);border-radius:6px;height:14px"><div style="width:' + w + '%;height:14px;border-radius:6px;background:#0071e3"></div></div>' +
+          '<span class="small" style="text-align:right">' + fmtNum(f.users) + ' 人' + (f.rate != null ? '<span class="faint"> · ' + f.rate + '%</span>' : '') + '</span></div>';
+      }).join('') + '<p class="faint xs" style="margin:8px 0 0">百分比是相对上一步的转化率。"开通 VIP"目前是演示开通，接入支付后就是真实付费。</p>';
+      $('#vipSrc').textContent = r.vipBySource.length ? '有效 VIP 来源：' + r.vipBySource.map(function (x) { return x.source + ' ' + x.count + ' 人'; }).join('，') : '';
+      $('#feat').innerHTML = r.features.length ? table([['label', '功能'], ['count', '使用次数']], r.features, { num: ['count'] }) : '<p class="muted small" style="padding:12px">这个时间段还没有功能使用记录。</p>';
+      $('#invCount').textContent = '邀请注册：' + fmtNum(r.invitedSignups) + ' 人';
+      $('#inv').innerHTML = r.inviters.length ? table([['email', '邀请人邮箱'], ['nickname', '昵称'], ['code', '邀请码'], ['invited', '带来注册']], r.inviters, { num: ['invited'] }) : '<p class="muted small" style="padding:12px">这个时间段还没有通过邀请链接注册的用户。</p>';
+    }, function (e) { $('#funnel').innerHTML = '<p class="muted small">加载失败：' + esc(Cloud.errText(e)) + '</p>'; });
+  }
   function filters() { return { from: state.from, to: state.to, dateField: state.dateField, keyword: state.keyword }; }
 
   var lastDaily = null;
@@ -115,7 +144,7 @@
   }
 
   var USER_COLS = [['email', '邮箱'], ['nickname', '昵称'], ['school', '学校'], ['grade', '年级'], ['createdAt', '注册时间'], ['firstLoginAt', '首次登录'], ['lastLoginAt', '最后登录'], ['lastActiveAt', '最后活跃'],
-    ['loginCount', '登录次数'], ['solvedCount', '已做对题数'], ['completion', '完成进度%'], ['projectsDone', '完成项目'], ['xpTotal', '经验值'], ['attempts', '提交次数'], ['accuracy', '正确率%'], ['streak', '连续天数'], ['vipUntil', 'VIP 到期'], ['uid', 'uid']];
+    ['loginCount', '登录次数'], ['solvedCount', '已做对题数'], ['completion', '完成进度%'], ['projectsDone', '完成项目'], ['xpTotal', '经验值'], ['attempts', '提交次数'], ['accuracy', '正确率%'], ['streak', '连续天数'], ['vipUntil', 'VIP 到期'], ['vipSource', 'VIP 来源'], ['inviteCode', '邀请码'], ['invitedBy', '邀请人码'], ['uid', 'uid']];
   var TIME_COLS = ['createdAt', 'firstLoginAt', 'lastLoginAt', 'lastActiveAt'];
   function cell(row, k) { var v = row[k]; if (TIME_COLS.indexOf(k) >= 0) return cst(v); if (k === 'solvedCount') return v + (row.totalQuestions ? ' / ' + row.totalQuestions : ''); return v == null ? '' : v; }
   function loadUsers() {
